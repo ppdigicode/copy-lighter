@@ -92,6 +92,9 @@ class CopyTradingBot:
         # ---- Order latency tracking ----
         self.order_target_timestamps = {}  # {market_index: target_fill_timestamp_ms} - for latency calculation
         
+        # ---- Last observed prices (for market orders) ----
+        self.last_observed_prices = {}  # {market_index: last_price} - from fills
+        
         # ---- Order placement lock (prevent nonce conflicts) ----
         self.order_lock = threading.Lock()
 
@@ -447,88 +450,60 @@ class CopyTradingBot:
 
     def _check_orphan_positions(self):
         """
-        IMPROVED VERSION from Hyperliquid bot:
+        SIMPLE VERSION - Use normal order placement!
         
-        If the target is FLAT on a market but we still have an open position,
-        force close our remaining position using reduce_only=True.
-        
-        This runs periodically in a background thread to avoid adding latency
-        to the WS receiver / fill pipeline.
-        
-        KEY IMPROVEMENT: Batch price fetching for efficiency and better fallback logic.
+        If target is flat but we have a position, close it using
+        the exact same logic as normal closes (reduce_only=True).
         """
         if self.stop_event.is_set() or self.dry_run:
             return
         
-        if not self.signer_client or not self.account_api or not self.order_api:
+        if not self.signer_client or not self.account_api:
             return
 
-        # 1. Get target and our actual positions
+        # Get positions
         with self.state_lock:
             target_actual = dict(self.target_positions_actual)
             our_positions = dict(self.open_positions)
 
         if not our_positions:
-            return  # Nothing to reconcile
+            return
 
-        # 2. Build price map once (for all markets we need to close)
-        # This is more efficient than fetching price per market
-        price_map = {}
-        markets_to_check = []
-        
+        now = time.time()
+
+        # Check each position
         for market_index, our_size in our_positions.items():
             if abs(our_size) < 1e-8:
                 continue
             
             target_size = target_actual.get(market_index, 0.0)
-            if abs(target_size) < 1e-8:
-                # Target is flat but we're not - need to close
-                markets_to_check.append(market_index)
-        
-        # Fetch prices for markets that need closing
-        for market_index in markets_to_check:
-            is_buy = our_positions[market_index] < 0
-            price = self._get_market_price_for_orphan(market_index, is_buy)
-            if price and price > 0:
-                price_map[market_index] = price
-
-        now = time.time()
-
-        # 3. For each orphan position, attempt to close
-        for market_index in markets_to_check:
-            our_size = our_positions[market_index]
             
-            # Rate-limit per market (avoid spamming if exchange rejects)
+            # Skip if target also has position
+            if abs(target_size) >= 1e-8:
+                continue
+            
+            # ORPHAN: Target = 0, We ≠ 0
+            
+            # Rate-limit
             with self.state_lock:
                 last = float(self.last_orphan_close_ts.get(market_index, 0.0))
             
             if now - last < self.orphan_close_cooldown_sec:
-                continue  # Still in cooldown
+                continue
             
             with self.state_lock:
                 self.last_orphan_close_ts[market_index] = now
 
-            is_buy = our_size < 0  # If SHORT, we BUY to close
+            is_buy = our_size < 0
             size = abs(our_size)
             
-            # Get price from map
-            price = price_map.get(market_index)
-            if not price or price <= 0:
-                symbol = self._get_market_symbol(market_index)
-                print(f"\n🔍 Orphan detected: {symbol} (our: {our_size:+.4f}, target: 0)")
-                print(f"   ⚠️  Could not get market price, will retry in {self.orphan_close_cooldown_sec:.1f}s")
-                # Reset cooldown to retry sooner (0.5s instead of full cooldown)
-                with self.state_lock:
-                    self.last_orphan_close_ts[market_index] = now - self.orphan_close_cooldown_sec + 0.5
-                continue
-
             symbol = self._get_market_symbol(market_index)
-            print(f"\n🧹 RECONCILE: Target is flat on {symbol} but we still have {our_size:+.6f}. Forcing close...")
             
             try:
-                self._close_orphan_position(market_index, size, price, is_buy)
+                # Just close it with market order
+                self._close_orphan_position(market_index, size, 0, is_buy)
             except Exception as e:
-                print(f"❌ RECONCILE: Failed to close residual {symbol}: {e}")
+                print(f"❌ RECONCILE: Failed to close {symbol}: {e}")
                 import traceback
                 traceback.print_exc()
     
@@ -536,25 +511,55 @@ class CopyTradingBot:
         """
         Get market price specifically for orphan closes.
         
-        This has better error handling than the regular _get_market_price
-        and can fallback to mid-price if one side is missing.
+        STRATEGY:
+        1. Try custom logic with fallbacks
+        2. If that fails, use existing _get_market_price() as ultimate fallback
         
         Returns None if price unavailable.
         """
-        if not self.order_api or not self.main_loop:
+        if not self.order_api:
+            print(f"   🔍 DEBUG: order_api is None")
+            return None
+        
+        if not self.main_loop:
+            print(f"   🔍 DEBUG: main_loop is None")
+            return None
+        
+        if not self.main_loop.is_running():
+            print(f"   🔍 DEBUG: main_loop is not running")
             return None
         
         try:
-            if self.main_loop and self.main_loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    self._get_market_price_for_orphan_async(market_index, is_buy),
-                    self.main_loop
-                )
-                return future.result(timeout=5)
+            future = asyncio.run_coroutine_threadsafe(
+                self._get_market_price_for_orphan_async(market_index, is_buy),
+                self.main_loop
+            )
+            result = future.result(timeout=5)
+            if result:
+                print(f"   🔍 DEBUG: Got price {result} for market {market_index}")
+                return result
+            else:
+                print(f"   🔍 DEBUG: Price fetch returned None, trying fallback...")
+                # FALLBACK: Try the existing _get_market_price() function
+                fallback_price = self._get_market_price(market_index, is_buy)
+                if fallback_price:
+                    print(f"   🔍 DEBUG: Fallback succeeded with price {fallback_price}")
+                    return fallback_price
+                else:
+                    print(f"   🔍 DEBUG: Fallback also failed")
+                    return None
+        except asyncio.TimeoutError:
+            print(f"   🔍 DEBUG: Timeout fetching price for market {market_index}")
+            # Try fallback
+            print(f"   🔍 DEBUG: Trying fallback after timeout...")
+            return self._get_market_price(market_index, is_buy)
         except Exception as e:
-            # Silent fail - caller will handle
-            pass
-        return None
+            print(f"   🔍 DEBUG: Error fetching price for market {market_index}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Try fallback
+            print(f"   🔍 DEBUG: Trying fallback after exception...")
+            return self._get_market_price(market_index, is_buy)
 
     async def _get_market_price_for_orphan_async(self, market_index, is_buy):
         """
@@ -564,9 +569,11 @@ class CopyTradingBot:
         3. If both missing, return None
         """
         try:
+            print(f"   🔍 DEBUG: Fetching orderbook for market {market_index}")
             order_book_response = await self.order_api.order_book_details(market_id=str(market_index))
             
             if not order_book_response:
+                print(f"   🔍 DEBUG: order_book_response is None")
                 return None
             
             # Extract order book
@@ -575,9 +582,12 @@ class CopyTradingBot:
             elif hasattr(order_book_response, 'spot_order_book_details'):
                 order_book = order_book_response.spot_order_book_details
             else:
+                print(f"   🔍 DEBUG: No order_book_details or spot_order_book_details attribute")
+                print(f"   🔍 DEBUG: Response attributes: {dir(order_book_response)}")
                 return None
             
             if not order_book:
+                print(f"   🔍 DEBUG: order_book is None")
                 return None
             
             # Extract prices
@@ -586,47 +596,52 @@ class CopyTradingBot:
             
             if hasattr(order_book, 'bids') and order_book.bids:
                 best_bid = float(order_book.bids[0].price)
+                print(f"   🔍 DEBUG: best_bid = {best_bid}")
+            else:
+                print(f"   🔍 DEBUG: No bids available")
             
             if hasattr(order_book, 'asks') and order_book.asks:
                 best_ask = float(order_book.asks[0].price)
+                print(f"   🔍 DEBUG: best_ask = {best_ask}")
+            else:
+                print(f"   🔍 DEBUG: No asks available")
             
-            # Priority logic for orphan closes:
-            # 1. If buying to close SHORT, use best ask
-            # 2. If selling to close LONG, use best bid
-            # 3. If preferred side missing, use mid-price
-            # 4. If both missing, return None
-            
+            # Priority logic for orphan closes
             if is_buy:
                 if best_ask and best_ask > 0:
+                    print(f"   🔍 DEBUG: Using best_ask {best_ask} for BUY")
                     return best_ask
                 elif best_bid and best_bid > 0:
-                    # Fallback: use bid (we'll cross spread)
+                    print(f"   🔍 DEBUG: Fallback to best_bid {best_bid} for BUY")
                     return best_bid
             else:
                 if best_bid and best_bid > 0:
+                    print(f"   🔍 DEBUG: Using best_bid {best_bid} for SELL")
                     return best_bid
                 elif best_ask and best_ask > 0:
-                    # Fallback: use ask (we'll cross spread)
+                    print(f"   🔍 DEBUG: Fallback to best_ask {best_ask} for SELL")
                     return best_ask
             
             # Last resort: mid-price
             if best_bid and best_ask and best_bid > 0 and best_ask > 0:
-                return (best_bid + best_ask) / 2.0
+                mid = (best_bid + best_ask) / 2.0
+                print(f"   🔍 DEBUG: Using mid-price {mid}")
+                return mid
             
+            print(f"   🔍 DEBUG: No valid price found")
             return None
                 
-        except Exception:
+        except Exception as e:
+            print(f"   🔍 DEBUG: Exception in _get_market_price_for_orphan_async: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _close_orphan_position(self, market_index, size, price, is_buy):
         """
-        Close an orphan position with special handling:
-        1. Uses reduce_only=True (already in _place_order_internal)
-        2. Bypasses minimum notional checks (exchange allows reduce-only below minimums)
-        3. Protection anti-reverse (already in _place_order_internal lines 798-803)
+        Close orphan position using MARKET ORDER via SDK
         
-        CRITICAL: The reduce_only=True flag at line 909 in _place_order_async allows
-        closing positions below minimum size/notional requirements.
+        Uses client.create_market_order() - much simpler!
         """
         symbol = self._get_market_symbol(market_index)
         
@@ -635,42 +650,285 @@ class CopyTradingBot:
             current_pos = self.open_positions.get(market_index, 0.0)
         
         if abs(current_pos) < 1e-8:
-            print(f"   ✅ Position {symbol} already closed")
-            return
+            return  # Already closed, skip silently
         
-        # 2. Adjust size to our actual position (protection anti-reverse)
+        # 2. Adjust size to actual position
         actual_size = abs(current_pos)
         if actual_size < size:
-            print(f"   ⚠️  Adjusting orphan close size: {size:.6f} → {actual_size:.6f} (our actual position)")
             size = actual_size
         
         # 3. Round the size
         size = self._round_size(market_index, size)
         
         if size <= 0:
-            print(f"   ⚠️  Rounded size is 0, position too small to close")
-            print(f"   ℹ️  Residual position will remain (below minimum size)")
-            return
+            return  # Too small, skip silently
         
-        # 4. Place the order with is_closing=True
-        # This will use reduce_only=True which allows closing below minimum notional
-        print(f"   📝 ORPHAN CLOSE: {'BUY' if is_buy else 'SELL'} {size:.4f} {symbol} @ ${price:.4f}")
+        print(f"   🧹 Closing orphan: {'BUY' if is_buy else 'SELL'} {size:.4f} {symbol}")
         
         try:
-            # Use internal order function with closing flag
-            # CRITICAL: is_closing=True sets reduce_only=True at line 909
-            # which bypasses min_base_amount check at line 875 (only for opens)
-            self._place_order_internal(
-                market_index=market_index,
-                is_buy=is_buy,
-                size=size,
-                price=price,
-                is_closing=True  # CRITICAL: This sets reduce_only=True
-            )
-            print(f"   ✅ Orphan close order submitted")
+            # Use market order - much simpler!
+            self._place_market_order_for_orphan(market_index, is_buy, size, symbol)
         except Exception as e:
-            print(f"   ❌ Orphan close failed: {e}")
+            print(f"   ❌ Failed: {e}")
+    
+    def _place_market_order_for_orphan(self, market_index, is_buy, size, symbol):
+        """Place MARKET order to close orphan using SDK's create_market_order()"""
+        
+        if self.dry_run:
+            print(f"🧪 DRY RUN: Would MARKET {'BUY' if is_buy else 'SELL'} {size:.4f} {symbol}")
+            return
+        
+        if not self.signer_client:
+            print(f"❌ ERROR: SignerClient not initialized")
+            return
+        
+        # Use run_coroutine_threadsafe
+        try:
+            if self.main_loop and self.main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._place_market_order_for_orphan_async(market_index, is_buy, size, symbol),
+                    self.main_loop
+                )
+                future.result(timeout=10)
+            else:
+                print(f"❌ ERROR: Main event loop not available")
+        except Exception as e:
+            print(f"❌ Market order failed: {e}")
             raise
+    
+    async def _place_market_order_for_orphan_async(self, market_index, is_buy, size, symbol):
+        """Async function to place market order for orphan"""
+        try:
+            # Get market metadata
+            market_meta = self.market_metadata.get(market_index, {})
+            size_decimals = market_meta.get('size_decimals', 4)
+            price_decimals = market_meta.get('price_decimals', 2)
+            
+            # Convert size to base_amount
+            base_amount = round(size * (10 ** size_decimals))
+            
+            # For avg_execution_price (worst acceptable price):
+            # Strategy: Use last observed price ± 50% margin
+            # This works for ANY coin regardless of price!
+            
+            with self.state_lock:
+                last_price = self.last_observed_prices.get(market_index)
+            
+            if last_price and last_price > 0:
+                # Use last observed price with WIDE margin (50%)
+                safety_margin = 0.50  # 50% margin
+                
+                if is_buy:
+                    # BUY: accept up to 50% above last price
+                    worst_price = last_price * (1 + safety_margin)
+                else:
+                    # SELL: accept down to 50% below last price  
+                    worst_price = last_price * (1 - safety_margin)
+                
+                avg_execution_price = round(worst_price * (10 ** price_decimals))
+            else:
+                # Fallback: Use conservative estimates per symbol
+                if 'BTC' in symbol.upper():
+                    if is_buy:
+                        avg_execution_price = round(150000 * (10 ** price_decimals))
+                    else:
+                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                elif 'ETH' in symbol.upper():
+                    if is_buy:
+                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                    else:
+                        avg_execution_price = round(500 * (10 ** price_decimals))
+                else:
+                    if is_buy:
+                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                    else:
+                        avg_execution_price = round(0.01 * (10 ** price_decimals))
+            
+            # CRITICAL: Serialize with lock
+            loop = asyncio.get_event_loop()
+            
+            async def _create_market_order_with_lock():
+                await loop.run_in_executor(None, self.order_lock.acquire)
+                try:
+                    # Use SDK's create_market_order function!
+                    result = await self.signer_client.create_market_order(
+                        market_index=market_index,
+                        client_order_index=0,
+                        base_amount=base_amount,
+                        avg_execution_price=avg_execution_price,
+                        is_ask=not is_buy,  # is_ask=True for SELL, False for BUY
+                    )
+                    return result
+                finally:
+                    self.order_lock.release()
+            
+            result = await _create_market_order_with_lock()
+            
+            # result is a tuple: (tx, tx_hash, error)
+            tx, tx_hash, err = result
+            
+            if err:
+                print(f"   ⚠️  Error: {err}")
+            else:
+                print(f"   ✅ Closed successfully")
+        
+        except Exception as e:
+            print(f"   ❌ Exception: {e}")
+            raise
+    
+    def _place_market_order_orphan(self, market_index, is_buy, size):
+        """
+        Place a MARKET order to close an orphan position.
+        
+        This bypasses all the price fetching complexity.
+        """
+        symbol = self._get_market_symbol(market_index)
+        side_str = 'BUY' if is_buy else 'SELL'
+        
+        # Round size
+        size = self._round_size(market_index, size)
+        
+        # Update estimated position
+        with self.state_lock:
+            current = self.open_positions_est.get(market_index, 0.0)
+            delta = size if is_buy else -size
+            new_est = current + delta
+            
+            # CRITICAL: Protection anti-reverse
+            if current > 0 and new_est < 0:
+                new_est = 0.0
+            elif current < 0 and new_est > 0:
+                new_est = 0.0
+            
+            self.open_positions_est[market_index] = new_est
+        
+        if self.dry_run:
+            print(f"🧪 DRY RUN: Would MARKET {side_str} {size:.4f} {symbol}")
+            return
+        
+        if not self.signer_client:
+            print(f"❌ ERROR: SignerClient not initialized")
+            # Revert estimated position
+            with self.state_lock:
+                current = self.open_positions_est.get(market_index, 0.0)
+                delta = size if is_buy else -size
+                self.open_positions_est[market_index] = current - delta
+            return
+        
+        # Use run_coroutine_threadsafe
+        try:
+            if self.main_loop and self.main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._place_market_order_orphan_async(market_index, is_buy, size, symbol, side_str),
+                    self.main_loop
+                )
+                future.result(timeout=10)
+            else:
+                print(f"❌ ERROR: Main event loop not available")
+                # Revert estimated position
+                with self.state_lock:
+                    current = self.open_positions_est.get(market_index, 0.0)
+                    delta = size if is_buy else -size
+                    self.open_positions_est[market_index] = current - delta
+        except Exception as e:
+            print(f"❌ Market order failed: {e}")
+            # Revert estimated position
+            with self.state_lock:
+                current = self.open_positions_est.get(market_index, 0.0)
+                delta = size if is_buy else -size
+                self.open_positions_est[market_index] = current - delta
+    
+    async def _place_market_order_orphan_async(self, market_index, is_buy, size, symbol, side_str):
+        """
+        Async function to place MARKET order for orphan close.
+        """
+        try:
+            # Get market metadata
+            market_meta = self.market_metadata.get(market_index, {})
+            size_decimals = market_meta.get('size_decimals', 4)
+            
+            print(f"📤 Placing MARKET order: {side_str} {size:.4f} {symbol}")
+            
+            # Convert to Lighter format
+            base_amount = round(size * (10 ** size_decimals))
+            
+            # CRITICAL: Serialize order placement
+            loop = asyncio.get_event_loop()
+            
+            async def _create_market_order_with_lock():
+                await loop.run_in_executor(None, self.order_lock.acquire)
+                try:
+                    # Try MARKET order type first
+                    # Check if ORDER_TYPE_MARKET exists
+                    if hasattr(self.signer_client, 'ORDER_TYPE_MARKET'):
+                        order_type = self.signer_client.ORDER_TYPE_MARKET
+                        print(f"   Using ORDER_TYPE_MARKET")
+                    else:
+                        # Fallback: Use IOC (Immediate-Or-Cancel) which acts like market
+                        order_type = self.signer_client.ORDER_TYPE_LIMIT
+                        print(f"   Using ORDER_TYPE_LIMIT with IOC (market-like)")
+                    
+                    # For MARKET orders, price is often ignored or set to 0
+                    # But let's use a safe extreme price to guarantee fill
+                    if is_buy:
+                        # BUY: set very high price to ensure fill
+                        limit_price = 999999999  # Will fill at market
+                    else:
+                        # SELL: set very low price to ensure fill
+                        limit_price = 1  # Will fill at market
+                    
+                    # For MARKET orders, DON'T pass time_in_force (not compatible)
+                    if order_type == self.signer_client.ORDER_TYPE_MARKET:
+                        result = await self.signer_client.create_order(
+                            market_index=market_index,
+                            is_ask=not is_buy,
+                            base_amount=base_amount,
+                            price=limit_price,
+                            order_type=order_type,
+                            # NO time_in_force for MARKET orders!
+                            reduce_only=True,
+                            client_order_index=0
+                        )
+                    else:
+                        # For LIMIT orders, use time_in_force
+                        result = await self.signer_client.create_order(
+                            market_index=market_index,
+                            is_ask=not is_buy,
+                            base_amount=base_amount,
+                            price=limit_price,
+                            order_type=order_type,
+                            time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                            reduce_only=True,
+                            client_order_index=0
+                        )
+                    return result
+                finally:
+                    self.order_lock.release()
+            
+            result = await _create_market_order_with_lock()
+            
+            # result is a tuple: (tx, tx_hash, error)
+            tx, tx_hash, err = result
+            
+            if err:
+                print(f"⚠️  Market order error: {err}")
+                # Revert estimated position
+                with self.state_lock:
+                    current = self.open_positions_est.get(market_index, 0.0)
+                    delta = size if is_buy else -size
+                    self.open_positions_est[market_index] = current - delta
+            else:
+                print(f"✅ Market order placed successfully")
+        
+        except Exception as e:
+            print(f"❌ Market order failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Revert estimated position
+            with self.state_lock:
+                current = self.open_positions_est.get(market_index, 0.0)
+                delta = size if is_buy else -size
+                self.open_positions_est[market_index] = current - delta
 
     # ------------------------
     # Coalescing
@@ -1036,8 +1294,9 @@ class CopyTradingBot:
             price_decimals = market_meta.get('price_decimals', 2)
             min_size = float(market_meta.get('min_size', '0.001'))
             
-            # Check minimum size
-            if size < min_size:
+            # CRITICAL: Only check minimum size for OPENS, not CLOSES
+            # Closes (reduce_only=True) can be below minimum
+            if not is_closing and size < min_size:
                 print(f"⏭️  Size {size:.6f} below minimum {min_size:.6f}, skipping")
                 # Revert estimated position
                 with self.state_lock:
@@ -1136,34 +1395,62 @@ class CopyTradingBot:
             if not order_book:
                 return None
             
+            # Get both bid and ask for fallback logic
+            best_bid = None
+            best_ask = None
+            
+            if hasattr(order_book, 'bids') and order_book.bids:
+                best_bid = float(order_book.bids[0].price)
+            
+            if hasattr(order_book, 'asks') and order_book.asks:
+                best_ask = float(order_book.asks[0].price)
+            
+            # Primary: use the side we need
             if is_buy:
-                if hasattr(order_book, 'asks') and order_book.asks:
-                    return float(order_book.asks[0].price)
-                return None
+                if best_ask:
+                    return best_ask
+                # Fallback: use bid if ask missing
+                if best_bid:
+                    return best_bid
             else:
-                if hasattr(order_book, 'bids') and order_book.bids:
-                    return float(order_book.bids[0].price)
-                return None
+                if best_bid:
+                    return best_bid
+                # Fallback: use ask if bid missing
+                if best_ask:
+                    return best_ask
+            
+            # Last resort: mid-price
+            if best_bid and best_ask:
+                return (best_bid + best_ask) / 2.0
+            
+            return None
                 
-        except Exception:
-            pass
-        return None
+        except Exception as e:
+            # Silent - caller will handle
+            return None
     
     def _get_market_price(self, market_index, is_buy):
         """Get current market price for a market (wrapper for thread)"""
-        if not self.order_api or not self.main_loop:
+        if not self.order_api:
+            return None
+        
+        if not self.main_loop:
             return None
         
         try:
-            if self.main_loop and self.main_loop.is_running():
+            if self.main_loop.is_running():
                 future = asyncio.run_coroutine_threadsafe(
                     self._get_market_price_async(market_index, is_buy),
                     self.main_loop
                 )
-                return future.result(timeout=5)
+                result = future.result(timeout=5)
+                return result
+            else:
+                return None
+        except asyncio.TimeoutError:
+            return None
         except Exception as e:
-            print(f"⚠️  Error in market price wrapper: {e}")
-        return None
+            return None
 
     def _apply_our_fill_to_positions(self, fill):
         """Update our position tracking when we get filled"""
@@ -1195,6 +1482,10 @@ class CopyTradingBot:
                 else:
                     self.open_positions[market_index] = new_pos
                     self.open_positions_est[market_index] = new_pos
+                
+                # Track last observed price for market orders
+                if price > 0:
+                    self.last_observed_prices[market_index] = price
                 
                 # Get target fill timestamp for latency calculation
                 target_fill_ts = self.order_target_timestamps.pop(market_index, None)
