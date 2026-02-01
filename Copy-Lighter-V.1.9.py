@@ -34,7 +34,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Copy Trading Bot v1.8 - Fixed Orphan Reconciliation")
+        print("\n🤖 Lighter Copy Trading Bot v1.9 - Fixed Orphan Reconciliation")
 
         load_dotenv()
 
@@ -270,7 +270,9 @@ class CopyTradingBot:
                 self._sync_target_actual_positions()
                 self._check_orphan_positions()
             except Exception as e:
-                pass
+                print(f"❌ Error in reconcile loop: {e}")
+                import traceback
+                traceback.print_exc()
 
     # ------------------------
     # Metadata
@@ -368,11 +370,27 @@ class CopyTradingBot:
             return
 
         try:
-            account = await self.account_api.account(by="index", value=str(self.our_account_index))
+            response = await self.account_api.account(by="index", value=str(self.our_account_index))
             
             new_positions = {}
-            if account and hasattr(account, 'positions'):
-                for pos in account.positions:
+            
+            # Try new format (like target sync) with 'accounts' list
+            if response and hasattr(response, 'accounts') and len(response.accounts) > 0:
+                account = response.accounts[0]
+                
+                if hasattr(account, 'positions'):
+                    for pos in account.positions:
+                        market_index = pos.market_id
+                        position_size = float(pos.position or 0)
+                        sign = getattr(pos, 'sign', 1)
+                        net_size = position_size * sign
+                        
+                        if abs(net_size) > 1e-8:
+                            new_positions[market_index] = net_size
+            
+            # Try old format (direct positions)
+            elif response and hasattr(response, 'positions'):
+                for pos in response.positions:
                     market_index = pos.market_id
                     position_size = float(pos.position or 0)
                     sign = getattr(pos, 'sign', 1)
@@ -396,7 +414,10 @@ class CopyTradingBot:
                     print("📊 No open positions")
 
         except Exception as e:
-            print(f"⚠️  Error syncing positions: {e}")
+            if verbose:
+                print(f"⚠️  Error syncing positions: {e}")
+                import traceback
+                traceback.print_exc()
 
     def _sync_positions_from_exchange(self, verbose=False, update_estimated=True):
         """Sync our actual positions from exchange (wrapper for thread)"""
@@ -449,7 +470,10 @@ class CopyTradingBot:
         if self.stop_event.is_set():
             return
         
-        if not self.account_api or not self.main_loop:
+        if not self.account_api:
+            return
+            
+        if not self.main_loop:
             return
 
         try:
@@ -461,7 +485,7 @@ class CopyTradingBot:
                 future.result(timeout=5)  # Wait max 5 seconds
         except Exception as e:
             if not self.stop_event.is_set():  # Only log if not shutting down
-                print(f"⚠️  Error in target position sync: {e}")
+                print(f"   ❌ Error in target position sync: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -478,10 +502,21 @@ class CopyTradingBot:
         if not self.signer_client or not self.account_api:
             return
 
+        # CRITICAL: Sync OUR positions first (to detect manual positions)
+        try:
+            if self.main_loop and self.main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._sync_positions_from_exchange_async(verbose=False),
+                    self.main_loop
+                )
+                future.result(timeout=2)
+        except Exception as e:
+            # Silent - will retry in 2 seconds
+            pass
+
         # Get positions
         with self.state_lock:
             target_actual = dict(self.target_positions_actual)
-            # Use REAL positions like Hyperliquid (not estimated)
             our_positions = dict(self.open_positions)
 
         if not our_positions:
@@ -496,17 +531,22 @@ class CopyTradingBot:
             
             target_size = target_actual.get(market_index, 0.0)
             
+            symbol = self._get_market_symbol(market_index)
+            
             # Skip if target also has position
             if abs(target_size) >= 1e-8:
                 continue
             
             # ORPHAN: Target = 0, We ≠ 0
+            print(f"\n🚨 ORPHAN DETECTED: {symbol} (we: {our_size:.4f}, target: 0)")
             
             # Rate-limit
             with self.state_lock:
                 last = float(self.last_orphan_close_ts.get(market_index, 0.0))
             
             if now - last < self.orphan_close_cooldown_sec:
+                remaining = self.orphan_close_cooldown_sec - (now - last)
+                print(f"   ⏳ Rate limited, retry in {remaining:.1f}s")
                 continue
             
             with self.state_lock:
@@ -514,8 +554,6 @@ class CopyTradingBot:
 
             is_buy = our_size < 0
             size = abs(our_size)
-            
-            symbol = self._get_market_symbol(market_index)
             
             try:
                 # Just close it with market order
