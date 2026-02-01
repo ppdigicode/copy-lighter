@@ -464,6 +464,7 @@ class CopyTradingBot:
         # Get positions
         with self.state_lock:
             target_actual = dict(self.target_positions_actual)
+            # Use REAL positions like Hyperliquid (not estimated)
             our_positions = dict(self.open_positions)
 
         if not our_positions:
@@ -645,7 +646,19 @@ class CopyTradingBot:
         """
         symbol = self._get_market_symbol(market_index)
         
-        # 1. Double-check we still have the position
+        # CRITICAL: Sync our actual position from exchange FIRST (like Hyperliquid)
+        # This prevents closing a position that was already closed by normal flow
+        try:
+            if self.main_loop and self.main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._sync_positions_from_exchange_async(verbose=False),
+                    self.main_loop
+                )
+                future.result(timeout=2)
+        except Exception:
+            pass  # Continue anyway, use cached position
+        
+        # Double-check we still have the position AFTER sync
         with self.state_lock:
             current_pos = self.open_positions.get(market_index, 0.0)
         
