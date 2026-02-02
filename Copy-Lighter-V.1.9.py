@@ -34,7 +34,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Copy Trading Bot v1.9 - Fixed Orphan Reconciliation")
+        print("\n🤖 Lighter Copy Trading Bot v1.9 - Fixed Orphan Reconciliation + safety flatten")
 
         load_dotenv()
 
