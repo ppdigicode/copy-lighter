@@ -117,7 +117,7 @@ class CopyTradingBot:
 
         # ---- Periodic target state reconciliation ----
         self.target_state_sync_interval_sec = float(os.getenv("TARGET_STATE_SYNC_INTERVAL_SEC", "2.0"))
-        self.orphan_close_cooldown_sec = float(os.getenv("ORPHAN_CLOSE_COOLDOWN_SEC", "1.0"))
+        self.orphan_close_cooldown_sec = float(os.getenv("ORPHAN_CLOSE_COOLDOWN_SEC", "2.0"))  # Increased from 1.0
         self.target_positions_actual = {}   # {market_index: net size} from API
         self.last_orphan_close_ts = {}      # {market_index: last_attempt_time_sec}
         self.target_state_thread = None
@@ -503,8 +503,12 @@ class CopyTradingBot:
             return
 
         # CRITICAL: Sync OUR positions first (to detect manual positions)
+        # Wait a bit longer to let pending fills arrive
         try:
             if self.main_loop and self.main_loop.is_running():
+                # Sleep 100ms to let pending fills process
+                time.sleep(0.1)
+                
                 future = asyncio.run_coroutine_threadsafe(
                     self._sync_positions_from_exchange_async(verbose=False),
                     self.main_loop
@@ -740,10 +744,16 @@ class CopyTradingBot:
             print(f"   ❌ Failed: {e}")
     
     def _place_market_order_for_orphan(self, market_index, is_buy, size, symbol):
-        """Place MARKET order to close orphan using SDK's create_market_order()"""
+        """
+        Place aggressive LIMIT order to close orphan (same as normal close + reduce_only).
+        
+        Uses exact same create_order call as normal closes, but with:
+        - Very aggressive price (10% margin) for immediate fill
+        - reduce_only=True to prevent inverse position opening
+        """
         
         if self.dry_run:
-            print(f"🧪 DRY RUN: Would MARKET {'BUY' if is_buy else 'SELL'} {size:.4f} {symbol}")
+            print(f"🧪 DRY RUN: Would LIMIT {'BUY' if is_buy else 'SELL'} {size:.4f} {symbol}")
             return
         
         if not self.signer_client:
@@ -765,7 +775,15 @@ class CopyTradingBot:
             raise
     
     async def _place_market_order_for_orphan_async(self, market_index, is_buy, size, symbol):
-        """Async function to place market order for orphan"""
+        """
+        Place MARKET order with reduce_only=True (from Lighter official docs).
+        
+        Uses create_order with:
+        - ORDER_TYPE_MARKET
+        - ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+        - reduce_only=True (prevents inverse position opening)
+        - DEFAULT_IOC_EXPIRY
+        """
         try:
             # Get market metadata
             market_meta = self.market_metadata.get(market_index, {})
@@ -775,62 +793,61 @@ class CopyTradingBot:
             # Convert size to base_amount
             base_amount = round(size * (10 ** size_decimals))
             
-            # For avg_execution_price (worst acceptable price):
-            # Strategy: Use last observed price ± 50% margin
-            # This works for ANY coin regardless of price!
-            
+            # Calculate worst acceptable price with 50% margin
             with self.state_lock:
                 last_price = self.last_observed_prices.get(market_index)
             
             if last_price and last_price > 0:
-                # Use last observed price with WIDE margin (50%)
-                safety_margin = 0.50  # 50% margin
+                # Use 50% margin
+                safety_margin = 0.50
                 
                 if is_buy:
-                    # BUY: accept up to 50% above last price
                     worst_price = last_price * (1 + safety_margin)
                 else:
-                    # SELL: accept down to 50% below last price  
                     worst_price = last_price * (1 - safety_margin)
                 
-                avg_execution_price = round(worst_price * (10 ** price_decimals))
+                price_int = round(worst_price * (10 ** price_decimals))
             else:
-                # Fallback: Use conservative estimates per symbol
+                # Fallback estimates
                 if 'BTC' in symbol.upper():
                     if is_buy:
-                        avg_execution_price = round(150000 * (10 ** price_decimals))
+                        price_int = round(150000 * (10 ** price_decimals))
                     else:
-                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                        price_int = round(10000 * (10 ** price_decimals))
                 elif 'ETH' in symbol.upper():
                     if is_buy:
-                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                        price_int = round(10000 * (10 ** price_decimals))
                     else:
-                        avg_execution_price = round(500 * (10 ** price_decimals))
+                        price_int = round(500 * (10 ** price_decimals))
                 else:
                     if is_buy:
-                        avg_execution_price = round(10000 * (10 ** price_decimals))
+                        price_int = round(10000 * (10 ** price_decimals))
                     else:
-                        avg_execution_price = round(0.01 * (10 ** price_decimals))
+                        price_int = round(0.01 * (10 ** price_decimals))
             
             # CRITICAL: Serialize with lock
             loop = asyncio.get_event_loop()
             
-            async def _create_market_order_with_lock():
+            async def _create_order_with_lock():
                 await loop.run_in_executor(None, self.order_lock.acquire)
                 try:
-                    # Use SDK's create_market_order function!
-                    result = await self.signer_client.create_market_order(
+                    # EXACT copy from Lighter docs - use full constant names!
+                    result = await self.signer_client.create_order(
                         market_index=market_index,
                         client_order_index=0,
                         base_amount=base_amount,
-                        avg_execution_price=avg_execution_price,
-                        is_ask=not is_buy,  # is_ask=True for SELL, False for BUY
+                        price=price_int,
+                        is_ask=not is_buy,
+                        order_type=self.signer_client.ORDER_TYPE_MARKET,
+                        time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                        reduce_only=True,  # ✅ CRITICAL: Prevents inverse position!
+                        order_expiry=self.signer_client.DEFAULT_IOC_EXPIRY,
                     )
                     return result
                 finally:
                     self.order_lock.release()
             
-            result = await _create_market_order_with_lock()
+            result = await _create_order_with_lock()
             
             # result is a tuple: (tx, tx_hash, error)
             tx, tx_hash, err = result
@@ -844,160 +861,6 @@ class CopyTradingBot:
             print(f"   ❌ Exception: {e}")
             raise
     
-    def _place_market_order_orphan(self, market_index, is_buy, size):
-        """
-        Place a MARKET order to close an orphan position.
-        
-        This bypasses all the price fetching complexity.
-        """
-        symbol = self._get_market_symbol(market_index)
-        side_str = 'BUY' if is_buy else 'SELL'
-        
-        # Round size
-        size = self._round_size(market_index, size)
-        
-        # Update estimated position
-        with self.state_lock:
-            current = self.open_positions_est.get(market_index, 0.0)
-            delta = size if is_buy else -size
-            new_est = current + delta
-            
-            # CRITICAL: Protection anti-reverse
-            if current > 0 and new_est < 0:
-                new_est = 0.0
-            elif current < 0 and new_est > 0:
-                new_est = 0.0
-            
-            self.open_positions_est[market_index] = new_est
-        
-        if self.dry_run:
-            print(f"🧪 DRY RUN: Would MARKET {side_str} {size:.4f} {symbol}")
-            return
-        
-        if not self.signer_client:
-            print(f"❌ ERROR: SignerClient not initialized")
-            # Revert estimated position
-            with self.state_lock:
-                current = self.open_positions_est.get(market_index, 0.0)
-                delta = size if is_buy else -size
-                self.open_positions_est[market_index] = current - delta
-            return
-        
-        # Use run_coroutine_threadsafe
-        try:
-            if self.main_loop and self.main_loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(
-                    self._place_market_order_orphan_async(market_index, is_buy, size, symbol, side_str),
-                    self.main_loop
-                )
-                future.result(timeout=10)
-            else:
-                print(f"❌ ERROR: Main event loop not available")
-                # Revert estimated position
-                with self.state_lock:
-                    current = self.open_positions_est.get(market_index, 0.0)
-                    delta = size if is_buy else -size
-                    self.open_positions_est[market_index] = current - delta
-        except Exception as e:
-            print(f"❌ Market order failed: {e}")
-            # Revert estimated position
-            with self.state_lock:
-                current = self.open_positions_est.get(market_index, 0.0)
-                delta = size if is_buy else -size
-                self.open_positions_est[market_index] = current - delta
-    
-    async def _place_market_order_orphan_async(self, market_index, is_buy, size, symbol, side_str):
-        """
-        Async function to place MARKET order for orphan close.
-        """
-        try:
-            # Get market metadata
-            market_meta = self.market_metadata.get(market_index, {})
-            size_decimals = market_meta.get('size_decimals', 4)
-            
-            print(f"📤 Placing MARKET order: {side_str} {size:.4f} {symbol}")
-            
-            # Convert to Lighter format
-            base_amount = round(size * (10 ** size_decimals))
-            
-            # CRITICAL: Serialize order placement
-            loop = asyncio.get_event_loop()
-            
-            async def _create_market_order_with_lock():
-                await loop.run_in_executor(None, self.order_lock.acquire)
-                try:
-                    # Try MARKET order type first
-                    # Check if ORDER_TYPE_MARKET exists
-                    if hasattr(self.signer_client, 'ORDER_TYPE_MARKET'):
-                        order_type = self.signer_client.ORDER_TYPE_MARKET
-                        print(f"   Using ORDER_TYPE_MARKET")
-                    else:
-                        # Fallback: Use IOC (Immediate-Or-Cancel) which acts like market
-                        order_type = self.signer_client.ORDER_TYPE_LIMIT
-                        print(f"   Using ORDER_TYPE_LIMIT with IOC (market-like)")
-                    
-                    # For MARKET orders, price is often ignored or set to 0
-                    # But let's use a safe extreme price to guarantee fill
-                    if is_buy:
-                        # BUY: set very high price to ensure fill
-                        limit_price = 999999999  # Will fill at market
-                    else:
-                        # SELL: set very low price to ensure fill
-                        limit_price = 1  # Will fill at market
-                    
-                    # For MARKET orders, DON'T pass time_in_force (not compatible)
-                    if order_type == self.signer_client.ORDER_TYPE_MARKET:
-                        result = await self.signer_client.create_order(
-                            market_index=market_index,
-                            is_ask=not is_buy,
-                            base_amount=base_amount,
-                            price=limit_price,
-                            order_type=order_type,
-                            # NO time_in_force for MARKET orders!
-                            reduce_only=True,
-                            client_order_index=0
-                        )
-                    else:
-                        # For LIMIT orders, use time_in_force
-                        result = await self.signer_client.create_order(
-                            market_index=market_index,
-                            is_ask=not is_buy,
-                            base_amount=base_amount,
-                            price=limit_price,
-                            order_type=order_type,
-                            time_in_force=self.signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                            reduce_only=True,
-                            client_order_index=0
-                        )
-                    return result
-                finally:
-                    self.order_lock.release()
-            
-            result = await _create_market_order_with_lock()
-            
-            # result is a tuple: (tx, tx_hash, error)
-            tx, tx_hash, err = result
-            
-            if err:
-                print(f"⚠️  Market order error: {err}")
-                # Revert estimated position
-                with self.state_lock:
-                    current = self.open_positions_est.get(market_index, 0.0)
-                    delta = size if is_buy else -size
-                    self.open_positions_est[market_index] = current - delta
-            else:
-                print(f"✅ Market order placed successfully")
-        
-        except Exception as e:
-            print(f"❌ Market order failed: {e}")
-            import traceback
-            traceback.print_exc()
-            # Revert estimated position
-            with self.state_lock:
-                current = self.open_positions_est.get(market_index, 0.0)
-                delta = size if is_buy else -size
-                self.open_positions_est[market_index] = current - delta
-
     # ------------------------
     # Coalescing
     # ------------------------
@@ -1703,16 +1566,25 @@ class CopyTradingBot:
         
         # If position closed, calculate and log PnL
         if position_closed and is_closing:
-            entry_price = self.trade_entry_prices.get(market_index, 0)
-            if entry_price > 0:
-                # Calculate our PnL
-                entry_cost = self.trade_entry_costs.get(market_index, 0)
+            entry_cost = self.trade_entry_costs.get(market_index, 0)
+            if entry_cost > 0:
+                # Calculate our PnL for this close
+                # If partial close, calculate proportional entry cost
+                total_position_size = abs(current)  # Size BEFORE this close
+                close_size = total_size  # Size of this close
+                
+                # Proportional entry cost for this close
+                if total_position_size > 0:
+                    proportional_entry_cost = entry_cost * (close_size / total_position_size)
+                else:
+                    proportional_entry_cost = entry_cost
+                
                 exit_value = total_cost  # This close's value
                 
                 if current > 0:  # Was LONG
-                    our_pnl = exit_value - entry_cost
+                    our_pnl = exit_value - proportional_entry_cost
                 else:  # Was SHORT
-                    our_pnl = entry_cost - exit_value
+                    our_pnl = proportional_entry_cost - exit_value
                 
                 # Get target's PnL for comparison
                 target_entry_cost = self.target_entry_costs.get(market_index, 0)
@@ -1733,7 +1605,7 @@ class CopyTradingBot:
                     
                     print(f"   💰 Position closed: PnL {pnl_sign}${our_pnl:.2f} (target: {target_pnl_sign}${target_pnl:.2f}, {pnl_ratio:.1f}%)")
                     
-                    # Clean up target tracking
+                    # Clean up target tracking ONLY if fully closed
                     self.target_entry_prices.pop(market_index, None)
                     self.target_entry_costs.pop(market_index, None)
                     self.target_position_sizes.pop(market_index, None)
@@ -1743,7 +1615,7 @@ class CopyTradingBot:
                     pnl_sign = "+" if our_pnl >= 0 else ""
                     print(f"   💰 Position closed: PnL {pnl_sign}${our_pnl:.2f}")
                 
-                # Clean up our tracking
+                # Clean up our tracking ONLY if fully closed
                 self.trade_entry_prices.pop(market_index, None)
                 self.trade_entry_costs.pop(market_index, None)
 
@@ -1751,7 +1623,12 @@ class CopyTradingBot:
     # Emergency flatten
     # ------------------------
     def emergency_flatten_all_positions(self):
-        """Emergency flatten all positions"""
+        """
+        Emergency flatten all positions using MARKET orders.
+        
+        Uses market orders (not limit) to ensure positions actually close
+        during disconnection, even in fast-moving markets.
+        """
         if self.dry_run or not self.signer_client:
             print("⚠️  SAFETY flatten skipped (dry-run or missing signer).")
             return
@@ -1765,22 +1642,19 @@ class CopyTradingBot:
                 print("✅ SAFETY: No positions to flatten.")
                 return
 
-            print(f"🚨 SAFETY: Flattening {len(positions)} position(s)...")
+            print(f"🚨 SAFETY: Flattening {len(positions)} position(s) with MARKET orders...")
             for market_index, pos in positions.items():
                 if abs(pos) < 1e-8:
                     continue
                 
-                is_buy = pos < 0
+                is_buy = pos < 0  # If SHORT, we BUY to close
                 size = abs(pos)
+                symbol = self._get_market_symbol(market_index)
                 
-                price = self._get_market_price(market_index, is_buy)
-                if not price:
-                    price = 1.0
-
                 try:
-                    self._place_order_internal(market_index, is_buy, size, price, is_closing=True)
+                    # Use market order for orphan close (guarantees fill)
+                    self._place_market_order_for_orphan(market_index, is_buy, size, symbol)
                 except Exception as e:
-                    symbol = self._get_market_symbol(market_index)
                     print(f"❌ SAFETY: Failed to flatten {symbol}: {e}")
 
             print("✅ SAFETY: Flatten attempt complete.\n")
