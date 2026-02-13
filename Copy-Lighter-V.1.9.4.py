@@ -38,7 +38,7 @@ class CopyTradingBot:
     """
 
     def __init__(self):
-        print("\n🤖 Lighter Trading Bot v1.9.4 (Position Tagging)")
+        print("\n🤖 Lighter Trading Bot v1.9.4 (Position Tagging+fix pnl)")
 
         load_dotenv()
 
@@ -1521,6 +1521,9 @@ class CopyTradingBot:
         """Add fill to buffer and start/reset timer for coalescing (V1.9.4: with tag tracking)"""
         with self.state_lock:
             if market_index not in self.pending_fills:
+                # Snapshot the CURRENT real position before any fill is applied.
+                # This is the only correct baseline for close_ratio in PnL calculations.
+                position_before = self.open_positions.get(market_index, 0.0)
                 self.pending_fills[market_index] = {
                     'total_size': 0,
                     'total_cost': 0,
@@ -1528,7 +1531,8 @@ class CopyTradingBot:
                     'side': side,
                     'timer': None,
                     'timestamp': fill.get('timestamp', time.time() * 1000),
-                    'client_order_index': client_order_index  # V1.9.4: Store tag
+                    'client_order_index': client_order_index,  # V1.9.4: Store tag
+                    'position_before': position_before,        # Snapshot for PnL
                 }
             
             # Add this fill
@@ -1575,6 +1579,9 @@ class CopyTradingBot:
             side = buffer['side']
             fills = buffer['fills']
             client_order_index = buffer.get('client_order_index', 0)  # V1.9.4: Extract tag
+            # Use the position snapshot taken at first-fill time, not the current
+            # open_positions value which may have been updated by subsequent flushes.
+            current = buffer.get('position_before', self.open_positions.get(market_index, 0.0))
             
             if total_size == 0:
                 return
@@ -1582,10 +1589,11 @@ class CopyTradingBot:
             # Calculate weighted average fill price
             avg_price = total_cost / total_size
             
-            # Update position
+            # current = position BEFORE this batch of fills (captured at first fill time)
+            # new_pos = what the real position will be after this batch
             delta = total_size if side == 'BUY' else -total_size
-            current = self.open_positions.get(market_index, 0.0)
-            new_pos = current + delta
+            actual_current = self.open_positions.get(market_index, 0.0)
+            new_pos = actual_current + delta
             
             # Track entry price for PnL calculation
             is_opening = (current == 0) or (current > 0 and delta > 0) or (current < 0 and delta < 0)
@@ -1676,8 +1684,28 @@ class CopyTradingBot:
 
             pnl_sign = "+" if our_pnl >= 0 else ""
 
+            # Compute target PnL for comparison (based on the same close fraction)
+            target_pnl_str = ""
+            with self.state_lock:
+                t_entry = self.target_entry_costs.get(market_index, 0)
+                t_exit  = self.target_exit_costs.get(market_index, 0)
+                t_size  = self.target_position_sizes.get(market_index, 0)
+            if t_entry > 0 and t_exit > 0:
+                # Proportion of target position closed so far (same direction as ours)
+                # Reconstruct target PnL on the same fraction as we closed
+                frac = abs(closed_entry_cost / t_entry) if t_entry > 0 else 0
+                t_closed_entry = t_entry * frac
+                t_exit_frac    = t_exit * frac
+                if current > 0:
+                    target_pnl = t_exit_frac - t_closed_entry
+                else:
+                    target_pnl = t_closed_entry - t_exit_frac
+                t_sign = "+" if target_pnl >= 0 else ""
+                pct_vs_target = (our_pnl / target_pnl * 100) if abs(target_pnl) > 1e-6 else 0
+                target_pnl_str = f" | target: {t_sign}${target_pnl:.2f} ({pct_vs_target:.0f}%)"
+
             if position_closed:
-                print(f"   💰 Position CLOSED: PnL {pnl_sign}${our_pnl:.2f}")
+                print(f"   💰 Position CLOSED: PnL {pnl_sign}${our_pnl:.2f}{target_pnl_str}")
                 # Clean up tous les trackers
                 self.trade_entry_prices.pop(market_index, None)
                 self.trade_entry_costs.pop(market_index, None)
@@ -1686,7 +1714,7 @@ class CopyTradingBot:
                 self.target_position_sizes.pop(market_index, None)
                 self.target_exit_costs.pop(market_index, None)
             else:
-                print(f"   💰 Partial close PnL: {pnl_sign}${our_pnl:.2f} (pos restante: {abs(new_pos):.4f})") 
+                print(f"   💰 Partial close PnL: {pnl_sign}${our_pnl:.2f}{target_pnl_str} (pos restante: {abs(new_pos):.4f})") 
 
     # ------------------------
     # Emergency flatten
