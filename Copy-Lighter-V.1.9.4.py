@@ -492,7 +492,12 @@ class CopyTradingBot:
 
         except Exception as e:
             if not self.stop_event.is_set():
-                print(f"⚠️  Error syncing target positions from API: {type(e).__name__}: {e}")
+                e_str = str(e)
+                code = next((c for c in ['500', '502', '503', '504', '429'] if c in e_str), None)
+                if code:
+                    print(f"⚠️  API sync unavailable (HTTP {code}), retrying...")
+                else:
+                    print(f"⚠️  Error syncing target positions: {type(e).__name__}: {e_str[:100]}")
 
     def _sync_target_actual_positions(self):
         """Sync target trader's actual positions (wrapper for thread)"""
@@ -514,9 +519,12 @@ class CopyTradingBot:
                 future.result(timeout=5)  # Wait max 5 seconds
         except Exception as e:
             if not self.stop_event.is_set():  # Only log if not shutting down
-                print(f"   ❌ Error in target position sync: {e}")
-                import traceback
-                traceback.print_exc()
+                e_str = str(e)
+                code = next((c for c in ['500', '502', '503', '504', '429'] if c in e_str), None)
+                if code:
+                    print(f"⚠️  API sync unavailable (HTTP {code}), retrying...")
+                else:
+                    print(f"⚠️  Target position sync error: {type(e).__name__}: {e_str[:100]}")
 
     def _check_orphan_positions(self):
         """
@@ -1765,7 +1773,8 @@ class CopyTradingBot:
         """Stream WebSocket from Lighter"""
         while not self.stop_event.is_set():
             try:
-                print(f"🔌 Connecting to Lighter WebSocket stream...")
+                if self.disconnect_start_time is None:
+                    print(f"🔌 Connecting to Lighter WebSocket stream...")
                 
                 async with websockets.connect(
                     self.ws_url,
@@ -1788,6 +1797,9 @@ class CopyTradingBot:
                         }))
                     
                     print("✅ WebSocket stream started. Waiting for events...")
+                    if self.disconnect_start_time is not None:
+                        elapsed = time.time() - self.disconnect_start_time
+                        print(f"✅ Reconnected after {elapsed:.0f}s outage")
                     self.disconnect_start_time = None
 
                     while not self.stop_event.is_set():
@@ -1870,7 +1882,15 @@ class CopyTradingBot:
                                         self._apply_our_fill_to_positions(trade)
 
             except Exception as e:
-                print(f"❌ WebSocket error: {e}")
+                # Only log on first disconnect to avoid flooding
+                if self.disconnect_start_time is None:
+                    e_str = str(e)
+                    code = next((c for c in ['500', '502', '503', '504'] if c in e_str), None)
+                    if code:
+                        print(f"❌ WebSocket error: HTTP {code} - server unavailable")
+                    else:
+                        print(f"❌ WebSocket error: {e_str[:100]}")
+                    print(f"🔁 Reconnecting every {self.reconnect_delay_sec}s until service recovers...")
 
                 # Flush coalesced fills on disconnect
                 try:
@@ -1889,7 +1909,6 @@ class CopyTradingBot:
                         self.emergency_flatten_all_positions()
                         self.disconnect_start_time = time.time()
 
-                print(f"🔁 Connection lost. Reconnecting in {self.reconnect_delay_sec} seconds...\n")
                 await asyncio.sleep(self.reconnect_delay_sec)
                 continue
 
